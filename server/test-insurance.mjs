@@ -1,6 +1,8 @@
 /**
- * 赛事事故与保险理赔 功能验证（投保 / 事故生成 / 报案 / 定损 / 赔付状态机 /
- * 租约押金联动 / 自有艇维修联动 / 资金声望 / 幂等 / 赛季到期 / 越站对称冲回）
+ * 赛事事故与保险理赔 功能验证（年度额度制）
+ * 覆盖：投保 / 事故生成 / 报案定损赔付状态机 / 同季连续理赔 / 年度额度封顶 /
+ * 租约押金联动 / 自有艇维修联动 / 资金声望 / 并发幂等 / 赛季到期归档 /
+ * 越站对称冲回（含年度额度恢复）/ 历史保单兼容迁移
  *
  * 用法：node --experimental-sqlite server/test-insurance.mjs（需要 Node ≥22.5 的 node:sqlite）
  * 在临时目录里起一份独立 DB 与独立端口的真实服务，跑完即销毁，不污染开发库。
@@ -46,9 +48,9 @@ async function playStation(port, cid) {
   assert.ok(settled.ok, `第 ${cid} 站结算失败：${settled.msg || ''}`)
   return { started, settled }
 }
-// 反复重置赛季直到出现事故（事故在开赛瞬间确定性生成，概率事件）
-async function playUntilIncident(port, { stations = 6, rent = false, plan = 3 } = {}) {
-  for (let attempt = 0; attempt < 60; attempt++) {
+// 反复重置赛季直到同一季出现 n 起事故（事故在开赛瞬间确定性生成，概率事件）
+async function playUntilIncidents(port, n, { stations = 6, rent = false, plan = 3 } = {}) {
+  for (let attempt = 0; attempt < 80; attempt++) {
     await post(port, '/api/reset')
     if (plan) {
       const buy = await post(port, '/api/insurance/buy', { id: plan })
@@ -59,13 +61,41 @@ async function playUntilIncident(port, { stations = 6, rent = false, plan = 3 } 
       assert.ok(r.ok, '租艇失败：' + r.msg)
     }
     const races = []
+    const hits = []
     for (let cid = 1; cid <= stations; cid++) {
       const r = await playStation(port, cid)
       races.push(r)
-      if (r.settled.incident) return { race: r, races, attempt }
+      if (r.settled.incident) hits.push(r)
+      if (hits.length >= n) return { hits, races, attempt }
     }
   }
-  throw new Error('多轮尝试后仍未出现事故')
+  throw new Error(`多轮尝试后仍未出现 ${n} 起事故`)
+}
+async function playUntilIncident(port, opts = {}) {
+  const r = await playUntilIncidents(port, 1, opts)
+  return { race: r.hits[0], races: r.races, attempt: r.attempt }
+}
+// 直接写库注入一条「已结算且带事故」的比赛记录（自有艇出赛），用于确定性地构造理赔场景；
+// 赛站标记完赛，created_ts 取注入当下（晚于任何已购保单，满足「保单先于开赛」）
+function injectIncidentRace(dir, { circuitId, damage = 20, level = 'major', season }) {
+  const dbh = new DatabaseSync(path.join(dir, 'sky.db'))
+  const c = dbh.prepare('SELECT * FROM circuits WHERE id=?').get(circuitId)
+  const ts = String(Date.now())
+  const rec = {
+    v: 1, circuit: { id: c.id, name: c.name, diff: c.diff, weather: c.weather }, season,
+    segments: [], factors: { weather: c.weather, rental: null, lineup: { shipMode: 'own' }, mods: [], pilot: null, mech: null, base: {} },
+    racers: [], events: [],
+    result: { rank: 2, pts: 18, money: 1000, wear: 8, repGain: 4 },
+    incident: { level, damage, cause: '注入事故' }
+  }
+  dbh.exec('BEGIN')
+  dbh.prepare('UPDATE circuits SET finished=1, rank=2 WHERE id=?').run(circuitId)
+  const rid = dbh.prepare(`INSERT INTO races (circuit_id,season,status,settled,rank,pts,money,wear,rep_gain,record,watch_el,created_at,created_ts,settled_at)
+    VALUES (?,?,'settled',1,2,18,1000,8,4,?,0,?,?,?)`)
+    .run(circuitId, season, JSON.stringify(rec), ts, Date.now(), ts).lastInsertRowid
+  dbh.exec('COMMIT')
+  dbh.close()
+  return Number(rid)
 }
 
 async function main() {
@@ -76,16 +106,21 @@ async function main() {
     proc = startServer(dir, PORT)
     await waitReady(PORT)
 
-    console.log('\n[保险] 方案目录与投保校验')
+    console.log('\n[保险] 方案目录与投保校验（年度额度制）')
     const s0 = await api(PORT, '/api/state')
     eq('初始无保单', s0.insurance.policy, null)
     eq('目录 3 个方案', s0.insurance.plans.length, 3)
+    eq('方案带年度额度', s0.insurance.plans.map(p => p.quota).join(','), '6000,15000,36000')
     const bad = await post(PORT, '/api/insurance/buy', { id: 99 })
     eq('非法方案被拒', bad.ok, false)
     const buy = await post(PORT, '/api/insurance/buy', { id: 2 })
     ok('投保成功', buy.ok)
     const moneyAfterBuy = (await api(PORT, '/api/state')).team.money
     eq('投保即扣保险费', moneyAfterBuy, s0.team.money - 2600)
+    const stPol = await api(PORT, '/api/state')
+    eq('新保单年度额度', stPol.insurance.policy.quota, 15000)
+    eq('新保单已赔付为 0', stPol.insurance.policy.paidTotal, 0)
+    eq('新保单剩余额度=年度额度', stPol.insurance.policy.remaining, 15000)
     const buy2 = await post(PORT, '/api/insurance/buy', { id: 1 })
     eq('每赛季仅一份保单', buy2.ok, false)
     // 赛中不可投保（防先出事后补保）
@@ -94,11 +129,12 @@ async function main() {
     eq('赛中投保被拒', buyMid.ok, false)
     await post(PORT, `/api/races/${st.race.id}/settle`, {})
 
-    console.log('\n[理赔状态机] 报案 → 定损 → 赔付（自有艇）')
-    // 上面第 1 站若无事故则重置直到出事故；用全险便于校验 100% 赔付
-    const found = await playUntilIncident(PORT, { plan: 3 })
-    const raceId = found.race.started.race.id
-    const snap = found.race.started.race.record.incident
+    console.log('\n[理赔状态机·连续理赔] 同一保单按事故状态连续报案/定损/赔付（自有艇）')
+    // 同一季出现两起事故；用全险便于校验 100% 赔付
+    const found = await playUntilIncidents(PORT, 2, { plan: 3 })
+    const [h1, h2] = found.hits
+    const snap1 = h1.started.race.record.incident
+    const snap2 = h2.started.race.record.incident
     const moneyBeforeClaim = (await api(PORT, '/api/state')).team.money
 
     // 无事故比赛报案被拒
@@ -107,46 +143,57 @@ async function main() {
       const repNone = await post(PORT, `/api/incidents/${noInc.started.race.id}/report`, {})
       eq('平安场次报案被拒', repNone.ok, false)
     }
-    // 未定损先赔付：接口路径按 id，未报案时理赔单不存在 → 404
-    // 报案（重复报案幂等）
-    const rep = await post(PORT, `/api/incidents/${raceId}/report`, {})
-    ok('报案成功', rep.ok)
-    const repAgain = await post(PORT, `/api/incidents/${raceId}/report`, {})
+    // 第 1 起：报案（重复报案幂等）→ 定损（幂等）→ 赔付（幂等）
+    const rep = await post(PORT, `/api/incidents/${h1.started.race.id}/report`, {})
+    ok('第 1 起报案成功', rep.ok)
+    const repAgain = await post(PORT, `/api/incidents/${h1.started.race.id}/report`, {})
     ok('重复报案幂等', repAgain.ok && repAgain.already)
     eq('报案单状态 reported', rep.incident.status, 'reported')
-    // 定损：自有艇按 25/点核定，服务端计算，客户端不可改金额
     const ass = await post(PORT, `/api/incidents/${rep.incident.id}/assess`, {})
     ok('定损成功', ass.ok)
-    eq('定损费=损伤×25（自有艇）', ass.incident.assessed, snap.damage * 25)
+    eq('定损费=损伤×25（自有艇）', ass.incident.assessed, snap1.damage * 25)
     const assAgain = await post(PORT, `/api/incidents/${rep.incident.id}/assess`, {})
     ok('重复定损幂等', assAgain.already)
-    // 赔付：全险 100%、上限 15000
     const pay = await post(PORT, `/api/incidents/${rep.incident.id}/payout`, {})
-    ok('赔付成功', pay.ok)
-    eq('赔付额=定损额（全险 100%）', pay.payout, snap.damage * 25)
-    const moneyAfterClaim = (await api(PORT, '/api/state')).team.money
-    eq('赔付金到账', moneyAfterClaim - moneyBeforeClaim, pay.payout)
+    ok('第 1 起赔付成功', pay.ok)
+    eq('赔付额=定损额（全险 100%）', pay.payout, snap1.damage * 25)
     const payAgain = await post(PORT, `/api/incidents/${rep.incident.id}/payout`, {})
     ok('重复赔付幂等不二次打款', payAgain.ok && payAgain.already)
-    eq('重复赔付金额为 0（幂等）', payAgain.incident.payout, pay.payout)
+    eq('重复赔付金额不变（幂等）', payAgain.incident.payout, pay.payout)
+    // 年度额度制：赔付后保单不结案，额度累计
     const st1 = await api(PORT, '/api/state')
-    eq('保单结案 claimed', st1.insurance.policy.status, 'claimed')
-    eq('保单记录理赔单 id', st1.insurance.policy.claimedIncidentId, rep.incident.id)
+    eq('赔付后保单仍保障中（不再一案结案）', st1.insurance.policy.status, 'active')
+    eq('已赔付累计到保单', st1.insurance.policy.paidTotal, pay.payout)
+    eq('剩余年度额度同步扣减', st1.insurance.policy.remaining, 36000 - pay.payout)
+
+    // 第 2 起：同一保单继续走完整理赔流程（旧制下会被「理赔一次」拦截）
+    const rep2 = await post(PORT, `/api/incidents/${h2.started.race.id}/report`, {})
+    ok('第 2 起事故可连续报案', rep2.ok)
+    const ass2 = await post(PORT, `/api/incidents/${rep2.incident.id}/assess`, {})
+    ok('第 2 起可连续定损', ass2.ok)
+    const pay2 = await post(PORT, `/api/incidents/${rep2.incident.id}/payout`, {})
+    ok('第 2 起可连续赔付', pay2.ok)
+    eq('第 2 起赔付额=定损额', pay2.payout, snap2.damage * 25)
+    const st2 = await api(PORT, '/api/state')
+    eq('年度额度累计两起赔付', st2.insurance.policy.paidTotal, pay.payout + pay2.payout)
+    eq('两起赔款均到账', st2.team.money - moneyBeforeClaim, pay.payout + pay2.payout)
+    eq('额度未尽保单仍保障中', st2.insurance.policy.status, 'active')
 
     console.log('\n[租赁艇联动] 事故损伤计入租约押金，定损按租约费率，赔付对冲')
     const r2 = await playUntilIncident(PORT, { rent: true, plan: 2, stations: 1 })
-    const snap2 = r2.race.started.race.record.incident
+    const snapR = r2.race.started.race.record.incident
     const raceId2 = r2.race.started.race.id
-    const rep2 = await post(PORT, `/api/incidents/${raceId2}/report`, {})
-    const ass2 = await post(PORT, `/api/incidents/${rep2.incident.id}/assess`, {})
-    eq('租约艇定损=损伤×租约费率35', ass2.incident.assessed, snap2.damage * 35)
-    eq('定损单标记租约艇', ass2.incident.ship.kind, 'rental')
-    const expectPay = Math.min(Math.round(snap2.damage * 35 * 0.75), 7000)
-    const pay2 = await post(PORT, `/api/incidents/${rep2.incident.id}/payout`, {})
-    eq('75% 方案赔付（含上限）', pay2.payout, expectPay)
+    const repR = await post(PORT, `/api/incidents/${raceId2}/report`, {})
+    const assR = await post(PORT, `/api/incidents/${repR.incident.id}/assess`, {})
+    eq('租约艇定损=损伤×租约费率35', assR.incident.assessed, snapR.damage * 35)
+    eq('定损单标记租约艇', assR.incident.ship.kind, 'rental')
+    const expectPay = Math.min(Math.round(snapR.damage * 35 * 0.75), 7000)
+    const payR = await post(PORT, `/api/incidents/${repR.incident.id}/payout`, {})
+    eq('75% 方案赔付（含单次上限）', payR.payout, expectPay)
+    eq('租约赔付计入年度额度', (await api(PORT, '/api/state')).insurance.policy.paidTotal, expectPay)
     // 归还：事故损伤与正常磨损一起按费率结算押金
     const ret = await post(PORT, '/api/rentals/return', {})
-    const wearTotal = r2.race.started.race.record.result.wear + snap2.damage
+    const wearTotal = r2.race.started.race.record.result.wear + snapR.damage
     eq('归还磨损费=（磨损+事故损伤）×35', ret.wearFee, wearTotal * 35)
     eq('归还退款=押金−磨损费', ret.refund, Math.max(0, 2400 - wearTotal * 35))
 
@@ -184,22 +231,23 @@ async function main() {
     console.log('\n[赛季结算] 完季保单到期、未决理赔单拒付、事故统计归档')
     await post(PORT, '/api/reset')
     await post(PORT, '/api/insurance/buy', { id: 2 })
-    let pending = null
+    let pending = null, pendingIncId = null
     for (let cid = 1; cid <= 6; cid++) {
       const r = await playStation(PORT, cid)
       if (r.settled.incident && !pending) pending = r
     }
     if (pending) {
-      const rp = await post(PORT, `/api/incidents/${pending.started.race.id}/report`, {})
-      await post(PORT, `/api/incidents/${rp.incident.id}/assess`, {})  // 只定损，不赔付
+      const rp5 = await post(PORT, `/api/incidents/${pending.started.race.id}/report`, {})
+      pendingIncId = rp5.incident.id
+      await post(PORT, `/api/incidents/${pendingIncId}/assess`, {})  // 只定损，不赔付
     }
     const moneyBeforeAdv = (await api(PORT, '/api/state')).team.money
     const adv = await post(PORT, '/api/seasons/advance', {})
     ok('衔接成功', adv.ok)
     eq('归档摘要带事故数', typeof adv.summary.incidents, 'number')
     eq('归档摘要带赔付统计', adv.summary.payouts, 0) // 本轮没有已赔付的单子
-    if (pending) {
-      const payLate = await post(PORT, `/api/incidents/${rp.incident.id}/payout`, {})
+    if (pendingIncId) {
+      const payLate = await post(PORT, `/api/incidents/${pendingIncId}/payout`, {})
       eq('往季未决单赔付被拒', payLate.ok, false)
       eq('拒付不产生资金变动', (await api(PORT, '/api/state')).team.money, moneyBeforeAdv)
     }
@@ -208,7 +256,7 @@ async function main() {
     const arch = st5.seasons.find(x => x.season === 1)
     ok('历届榜归档事故数', arch.incidents >= (pending ? 1 : 0))
 
-    console.log('\n[越站回滚] 已赔付理赔随越站作废对称冲回（赔款/保单/损伤恢复）')
+    console.log('\n[越站回滚] 已赔付理赔随越站作废对称冲回（赔款/年度额度恢复）')
     // 新一季：第 1 站事故并完成赔付
     const r6 = await playUntilIncident(PORT, { plan: 3, stations: 1 })
     const rp6 = await post(PORT, `/api/incidents/${r6.race.started.race.id}/report`, {})
@@ -217,10 +265,14 @@ async function main() {
     ok('第 1 站理赔已付', pay6.ok && pay6.payout > 0)
     const pre = await api(PORT, '/api/state')
     const moneyPre = pre.team.money
-    // 直接写库制造越站：跳过第 2 站，把第 3 站置为 finished 并塞一条带 crash 事故的已结算记录
+    eq('赔付后年度额度累计', pre.insurance.policy.paidTotal, pay6.payout)
+    // 直接写库制造越站：跳过第 2 站，把第 3 站置为 finished 并塞一条带 crash 事故的已结算记录，
+    // 其理赔单为「已赔付」（挂在当前保单上，额度已计入），验证越站冲回同时恢复年度额度
     const db = new DatabaseSync(path.join(dir, 'sky.db'))
     const season = db.prepare('SELECT season FROM team').get().season
+    const polId = pre.insurance.policy.id
     const c3 = db.prepare('SELECT * FROM circuits WHERE id=3').get()
+    const INJECTED_PAYOUT = 500
     const fake = {
       v: 1, circuit: { id: 3, name: c3.name, diff: c3.diff, weather: c3.weather }, season,
       segments: [], factors: { weather: c3.weather, rental: null, lineup: { shipMode: 'own' }, mods: [], pilot: null, mech: null, base: {} },
@@ -234,36 +286,213 @@ async function main() {
     const raceId3 = db.prepare(`INSERT INTO races (circuit_id,season,status,settled,rank,pts,money,wear,rep_gain,record,watch_el,created_at,created_ts,settled_at)
       VALUES (3,?,'settled',1,3,15,1200,10,3,?,0,?,?,?)`)
       .run(season, JSON.stringify(fake), ts, Date.now(), ts).lastInsertRowid
-    // 真实结算会同时落物理赔单（reported）：未赔付状态随越站作废
+    // 已赔付的越站理赔单：赔款与额度占用都应随越站对称冲回
+    db.prepare(`INSERT INTO incidents (race_id,season,circuit_id,level,cause,damage,repair_cost,assessed,payout,claim_id,status,created_at,reported_at,assessed_at,paid_at)
+      VALUES (?,?,?, 'crash','越站坠毁',30,750,750,?,?, 'paid', ?,?,?,?)`)
+      .run(raceId3, season, 3, INJECTED_PAYOUT, polId, ts, ts, ts, ts)
+    db.prepare('UPDATE insurance SET paid_total=paid_total+? WHERE id=?').run(INJECTED_PAYOUT, polId)
+    // 另注入一条「已报案未赔付」的越站理赔单（第 4 站），验证未决单只作废不冲钱
+    const c4 = db.prepare('SELECT * FROM circuits WHERE id=4').get()
+    const fake4 = { ...fake, circuit: { id: 4, name: c4.name, diff: c4.diff, weather: c4.weather }, incident: { level: 'major', damage: 18, cause: '越站受损' } }
+    db.prepare('UPDATE circuits SET finished=1, rank=4 WHERE id=4').run()
+    const raceId4 = db.prepare(`INSERT INTO races (circuit_id,season,status,settled,rank,pts,money,wear,rep_gain,record,watch_el,created_at,created_ts,settled_at)
+      VALUES (4,?,'settled',1,4,12,900,9,2,?,0,?,?,?)`)
+      .run(season, JSON.stringify(fake4), ts, Date.now(), ts).lastInsertRowid
     db.prepare(`INSERT INTO incidents (race_id,season,circuit_id,level,cause,damage,status,created_at,reported_at)
-      VALUES (?,?,?, 'crash','越站坠毁',30,'reported',?,?)`)
-      .run(raceId3, season, 3, ts, ts)
-    // 真实越站只在结算事务内产生一条「被比赛记录认领」的流水（此处不再额外注入，
-    // 未关联流水的兜底回滚路径由 test-consistency 场景覆盖）
+      VALUES (?,?,?, 'major','越站受损',18,'reported',?,?)`)
+      .run(raceId4, season, 4, ts, ts)
     db.exec('COMMIT')
     db.close()
     // 重启服务器触发启动迁移修复
     proc.kill('SIGKILL'); proc = null; await sleep(150)
     proc = startServer(dir, PORT)
     const post2 = await waitReady(PORT)
-    // 资金冲回分项：越站奖金 1200；因越站记录（rank3 完赛）被对账撤销的合约奖励；
-    // 若越站事故曾被赔付（此处未理赔，应为 0）
+    // 资金冲回分项：越站奖金 1200+900、越站已赔付赔款 500；因越站记录被对账撤销的合约奖励
     const revokedRewards = pre.contracts
       .filter(c => c.earned && !(post2.contracts.find(x => x.id === c.id)?.earned))
       .reduce((a, c) => a + c.reward, 0)
-    eq('合约冲回项非负（越站 rank3 完赛可影响条款）', revokedRewards >= 0, true)
-    eq('越站资金（奖金+对账合约）已冲回', Math.round(post2.team.money), Math.round(moneyPre - 1200 - revokedRewards))
+    eq('合约冲回项非负（越站完赛可影响条款）', revokedRewards >= 0, true)
+    eq('越站资金（奖金+赔款+对账合约）已冲回', Math.round(post2.team.money), Math.round(moneyPre - 1200 - 900 - INJECTED_PAYOUT - revokedRewards))
     const db2 = new DatabaseSync(path.join(dir, 'sky.db'))
     const voidRace = db2.prepare("SELECT status FROM races WHERE circuit_id=3").get()
     eq('越站记录置 void', voidRace.status, 'void')
     const inc3 = db2.prepare("SELECT i.status FROM incidents i JOIN races r ON r.id=i.race_id WHERE r.circuit_id=3").get()
-    eq('越站事故理赔单作废', inc3.status, 'void')
+    eq('越站已赔付理赔单作废', inc3.status, 'void')
+    const inc4 = db2.prepare("SELECT i.status FROM incidents i JOIN races r ON r.id=i.race_id WHERE r.circuit_id=4").get()
+    eq('越站未决理赔单作废', inc4.status, 'void')
     const inc1 = db2.prepare("SELECT status,payout FROM incidents WHERE race_id=?").get(r6.race.started.race.id)
     eq('第 1 站合法理赔仍为 paid', inc1.status, 'paid')
     eq('第 1 站赔款未被冲回', inc1.payout, pay6.payout)
-    const pol1 = db2.prepare("SELECT status,claimed_incident_id FROM insurance ORDER BY id DESC LIMIT 1").get()
-    eq('第 1 站保单仍为 claimed（未被误恢复）', pol1.status, 'claimed')
+    const pol1 = db2.prepare("SELECT status,paid_total,quota FROM insurance WHERE id=?").get(polId)
+    eq('越站冲回后保单仍保障中', pol1.status, 'active')
+    eq('年度额度仅恢复越站赔款部分', pol1.paid_total, pay6.payout)
+    eq('保单年度额度口径', pol1.quota, 36000)
     db2.close()
+
+    console.log('\n[历史保单兼容] 老行迁移补齐年度额度；老 active 保单按新制连续理赔')
+    // 模拟老库：直接插入一行没有 quota/paid_total 的 active 保单（老 schema）
+    await post(PORT, '/api/reset')
+    const dbL = new DatabaseSync(path.join(dir, 'sky.db'))
+    const seasonL = dbL.prepare('SELECT season FROM team').get().season
+    dbL.prepare(`INSERT INTO insurance (plan_id,name,season,premium,coverage,max_payout,status,created_at)
+      VALUES (2,'云安·全程护艇险',?,2600,0.75,7000,'active',?)`).run(seasonL, String(Date.now()))
+    dbL.close()
+    proc.kill('SIGKILL'); proc = null; await sleep(150)
+    proc = startServer(dir, PORT)
+    const stL = await waitReady(PORT)
+    eq('老 active 保单迁移出年度额度', stL.insurance.policy.quota, 15000)
+    eq('老保单已赔付初始为 0', stL.insurance.policy.paidTotal, 0)
+    eq('老保单状态保持有效', stL.insurance.policy.status, 'active')
+    // 老保单按新制连续理赔（两起注入事故）
+    const ridA = injectIncidentRace(dir, { circuitId: 1, damage: 20, season: seasonL })
+    const ridB = injectIncidentRace(dir, { circuitId: 2, damage: 12, season: seasonL })
+    const repA = await post(PORT, `/api/incidents/${ridA}/report`, {})
+    ok('老保单可报案（新制）', repA.ok)
+    const assA = await post(PORT, `/api/incidents/${repA.incident.id}/assess`, {})
+    eq('老保单定损口径不变', assA.incident.assessed, 20 * 25)
+    const payA = await post(PORT, `/api/incidents/${repA.incident.id}/payout`, {})
+    eq('老保单按 75% 赔付', payA.payout, Math.round(500 * 0.75))
+    const repB = await post(PORT, `/api/incidents/${ridB}/report`, {})
+    const assB = await post(PORT, `/api/incidents/${repB.incident.id}/assess`, {})
+    const payB = await post(PORT, `/api/incidents/${repB.incident.id}/payout`, {})
+    eq('老保单可连续理赔', payB.payout, Math.round(300 * 0.75))
+    const stL2 = await api(PORT, '/api/state')
+    eq('老保单年度额度累计', stL2.insurance.policy.paidTotal, Math.round(500 * 0.75) + Math.round(300 * 0.75))
+
+    console.log('\n[历史保单兼容] 老 claimed 保单（单季一次制）保持结案，不再赔付')
+    await post(PORT, '/api/reset')
+    const dbC = new DatabaseSync(path.join(dir, 'sky.db'))
+    const seasonC0 = dbC.prepare('SELECT season FROM team').get().season
+    const tsC = String(Date.now())
+    // 老库结案现场：第 1 站合法完赛 + 已赔付理赔单 + claimed 保单（无额度列）
+    const c1 = dbC.prepare('SELECT * FROM circuits WHERE id=1').get()
+    const recC = {
+      v: 1, circuit: { id: 1, name: c1.name, diff: c1.diff, weather: c1.weather }, season: seasonC0,
+      segments: [], factors: { weather: c1.weather, rental: null, lineup: { shipMode: 'own' }, mods: [], pilot: null, mech: null, base: {} },
+      racers: [], events: [],
+      result: { rank: 2, pts: 18, money: 1000, wear: 8, repGain: 4 },
+      incident: { level: 'major', damage: 20, cause: '老库事故' }
+    }
+    dbC.exec('BEGIN')
+    dbC.prepare('UPDATE circuits SET finished=1, rank=2 WHERE id=1').run()
+    const ridC = dbC.prepare(`INSERT INTO races (circuit_id,season,status,settled,rank,pts,money,wear,rep_gain,record,watch_el,created_at,created_ts,settled_at)
+      VALUES (1,?,'settled',1,2,18,1000,8,4,?,0,?,?,?)`)
+      .run(seasonC0, JSON.stringify(recC), tsC, Date.now(), tsC).lastInsertRowid
+    const legPolId = Number(dbC.prepare(`INSERT INTO insurance (plan_id,name,season,premium,coverage,max_payout,status,created_at,claimed_at)
+      VALUES (2,'云安·全程护艇险',?,2600,0.75,7000,'claimed',?,?)`).run(seasonC0, tsC, tsC).lastInsertRowid)
+    const legIncId = Number(dbC.prepare(`INSERT INTO incidents (race_id,season,circuit_id,level,cause,damage,repair_cost,assessed,payout,claim_id,status,created_at,reported_at,assessed_at,paid_at)
+      VALUES (?,?,?,'major','老库事故',20,500,500,375,?,'paid',?,?,?,?)`)
+      .run(ridC, seasonC0, 1, legPolId, tsC, tsC, tsC, tsC).lastInsertRowid)
+    dbC.prepare('UPDATE insurance SET claimed_incident_id=? WHERE id=?').run(legIncId, legPolId)
+    dbC.exec('COMMIT')
+    dbC.close()
+    proc.kill('SIGKILL'); proc = null; await sleep(150)
+    proc = startServer(dir, PORT)
+    const stC0 = await waitReady(PORT)
+    eq('老 claimed 保单迁移出年度额度', stC0.insurance.policy.quota, 15000)
+    eq('老 claimed 保单回填已赔付', stC0.insurance.policy.paidTotal, 375)
+    eq('老 claimed 保单保持结案', stC0.insurance.policy.status, 'claimed')
+    // 新事故可报案定损留档，但赔付被老保单结案态拦截
+    const ridD = injectIncidentRace(dir, { circuitId: 2, damage: 10, season: seasonC0 })
+    const repD = await post(PORT, `/api/incidents/${ridD}/report`, {})
+    ok('老 claimed 保单项下仍可报案留档', repD.ok)
+    const assD = await post(PORT, `/api/incidents/${repD.incident.id}/assess`, {})
+    ok('老 claimed 保单项下仍可定损', assD.ok)
+    const payD = await post(PORT, `/api/incidents/${repD.incident.id}/payout`, {})
+    eq('老 claimed 保单不再赔付', payD.ok, false)
+    ok('拦截原因指向旧制结案', /已理赔结案/.test(payD.msg || ''))
+
+    console.log('\n[历史保单兼容] 老 claimed 保单的已赔付事故越站 → 对称恢复为有效')
+    // 把老库结案现场搬到越站（第 3 站，跳过 1-2 站）：迁移补齐额度后，越站冲回应恢复保单
+    await post(PORT, '/api/reset')
+    const dbE = new DatabaseSync(path.join(dir, 'sky.db'))
+    const seasonE = dbE.prepare('SELECT season FROM team').get().season
+    const tsE = String(Date.now())
+    const c3E = dbE.prepare('SELECT * FROM circuits WHERE id=3').get()
+    const recE = {
+      v: 1, circuit: { id: 3, name: c3E.name, diff: c3E.diff, weather: c3E.weather }, season: seasonE,
+      segments: [], factors: { weather: c3E.weather, rental: null, lineup: { shipMode: 'own' }, mods: [], pilot: null, mech: null, base: {} },
+      racers: [], events: [],
+      result: { rank: 2, pts: 18, money: 1000, wear: 8, repGain: 4 },
+      incident: { level: 'major', damage: 20, cause: '老库越站事故' }
+    }
+    dbE.exec('BEGIN')
+    dbE.prepare('UPDATE circuits SET finished=1, rank=2 WHERE id=3').run()
+    const ridE = dbE.prepare(`INSERT INTO races (circuit_id,season,status,settled,rank,pts,money,wear,rep_gain,record,watch_el,created_at,created_ts,settled_at)
+      VALUES (3,?,'settled',1,2,18,1000,8,4,?,0,?,?,?)`)
+      .run(seasonE, JSON.stringify(recE), tsE, Date.now(), tsE).lastInsertRowid
+    const legPolId2 = Number(dbE.prepare(`INSERT INTO insurance (plan_id,name,season,premium,coverage,max_payout,status,created_at,claimed_at)
+      VALUES (2,'云安·全程护艇险',?,2600,0.75,7000,'claimed',?,?)`).run(seasonE, tsE, tsE).lastInsertRowid)
+    const legIncId2 = Number(dbE.prepare(`INSERT INTO incidents (race_id,season,circuit_id,level,cause,damage,repair_cost,assessed,payout,claim_id,status,created_at,reported_at,assessed_at,paid_at)
+      VALUES (?,?,?,'major','老库越站事故',20,500,500,375,?,'paid',?,?,?,?)`)
+      .run(ridE, seasonE, 3, legPolId2, tsE, tsE, tsE, tsE).lastInsertRowid)
+    dbE.prepare('UPDATE insurance SET claimed_incident_id=? WHERE id=?').run(legIncId2, legPolId2)
+    dbE.exec('COMMIT')
+    dbE.close()
+    proc.kill('SIGKILL'); proc = null; await sleep(150)
+    proc = startServer(dir, PORT)
+    const stE = await waitReady(PORT)
+    eq('越站冲回后老保单恢复有效', stE.insurance.policy.status, 'active')
+    eq('越站赔款冲回后已赔付归零', stE.insurance.policy.paidTotal, 0)
+    eq('年度额度完全恢复', stE.insurance.policy.remaining, 15000)
+    // 恢复后的老保单可按新制连续理赔
+    const ridF = injectIncidentRace(dir, { circuitId: 1, damage: 10, season: seasonE })
+    const repF = await post(PORT, `/api/incidents/${ridF}/report`, {})
+    const assF = await post(PORT, `/api/incidents/${repF.incident.id}/assess`, {})
+    const payF = await post(PORT, `/api/incidents/${repF.incident.id}/payout`, {})
+    eq('恢复后的老保单可重新赔付', payF.payout, Math.round(250 * 0.75))
+
+    console.log('\n[并发幂等·年度额度封顶] 并发抢额度不越上限，同一事故只赔一次')
+    await post(PORT, '/api/reset')
+    const buyQ = await post(PORT, '/api/insurance/buy', { id: 1 })  // 额度 6000 / 单次上限 3000 / 比例 50%
+    ok('投保成功', buyQ.ok)
+    const stQ0 = await api(PORT, '/api/state')
+    const seasonQ = stQ0.team.season
+    const moneyAfterBuyQ = stQ0.team.money
+    // 注入 4 起已结算事故：损伤 160 → 定损 4000 → 单笔赔付 min(2000, 3000, 剩余额度) = 2000；额度仅够 3 起
+    const raceIds = [1, 2, 3, 4].map(cid => injectIncidentRace(dir, { circuitId: cid, damage: 160, level: 'crash', season: seasonQ }))
+    const incIds = []
+    for (const rid of raceIds) {
+      const repQ = await post(PORT, `/api/incidents/${rid}/report`, {})
+      assert.ok(repQ.ok, '注入事故报案失败')
+      const assQ = await post(PORT, `/api/incidents/${repQ.incident.id}/assess`, {})
+      eq('注入事故定损=160×25', assQ.incident.assessed, 4000)
+      incIds.push(repQ.incident.id)
+    }
+    // 每起事故同时发两笔赔付请求（8 个并发）
+    const resps = await Promise.all(incIds.flatMap(id => [post(PORT, `/api/incidents/${id}/payout`, {}), post(PORT, `/api/incidents/${id}/payout`, {})]))
+    const byInc = incIds.map((id, i) => resps.slice(i * 2, i * 2 + 2))
+    let paidCount = 0, paidSum = 0
+    byInc.forEach(rs => {
+      const wins = rs.filter(r => r.ok && !r.already)
+      const idem = rs.filter(r => r.ok && r.already)
+      const denied = rs.filter(r => !r.ok)
+      if (wins.length) {
+        eq('同一起事故并发只赔付一次', wins.length, 1)
+        eq('该起另一笔并发请求幂等返回', idem.length, 1)
+        paidCount++
+        paidSum += wins[0].payout
+      } else {
+        eq('额度耗尽的事故两笔并发均被拒', denied.length, 2)
+      }
+    })
+    eq('年度额度 6000 恰好承保 3 起（2000×3）', paidCount, 3)
+    eq('并发赔付总额不越年度额度', paidSum, 6000)
+    const stQ = await api(PORT, '/api/state')
+    eq('已赔付封顶于年度额度', stQ.insurance.policy.paidTotal, 6000)
+    eq('剩余额度归零', stQ.insurance.policy.remaining, 0)
+    eq('赔款总额到账', stQ.team.money, moneyAfterBuyQ + 6000)
+    // 额度用尽后：仍可报案定损留档，仅赔付关闭
+    const ridG = injectIncidentRace(dir, { circuitId: 5, damage: 10, season: seasonQ })
+    const repG = await post(PORT, `/api/incidents/${ridG}/report`, {})
+    ok('额度用尽仍可报案留档', repG.ok)
+    const assG = await post(PORT, `/api/incidents/${repG.incident.id}/assess`, {})
+    ok('额度用尽仍可定损', assG.ok)
+    const payG = await post(PORT, `/api/incidents/${repG.incident.id}/payout`, {})
+    eq('额度用尽赔付被拒', payG.ok, false)
+    const insView = await api(PORT, '/api/insurance')
+    const deniedInc = insView.incidents.find(i => i.status === 'assessed')
+    ok('额度用尽事故的可执行动作提示关闭赔付', !!(deniedInc && deniedInc.elig && !deniedInc.elig.canPayout && /额度/.test(deniedInc.elig.reason)))
 
     proc.kill('SIGKILL'); proc = null; await sleep(120)
     rmSync(dir, { recursive: true, force: true })
@@ -271,6 +500,6 @@ async function main() {
     if (proc) proc.kill('SIGKILL')
     rmSync(dir, { recursive: true, force: true })
   }
-  console.log(`\n🎉 全部 ${pass} 项断言通过：投保/事故/报案/定损/赔付状态机、租约押金、维修、资金声望、幂等与赛季联动一致`)
+  console.log(`\n🎉 全部 ${pass} 项断言通过：年度额度制下的投保/连续报案定损赔付/额度封顶/并发幂等/租约押金/维修/资金声望/赛季归档/越站冲回/历史保单兼容一致`)
 }
 main().catch(e => { console.error('\n❌ 验证失败：', e); process.exit(1) })
