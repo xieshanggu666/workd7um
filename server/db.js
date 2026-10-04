@@ -139,7 +139,10 @@ CREATE TABLE IF NOT EXISTS lineup (
   updated_at TEXT
 );
 -- 保单：赛季开始可投保（每赛季一份），保险费不退，赛季结束（衔接）自然到期。
--- status=active 有效（可报案）| expired 已到期（未用完的赛季失效）| claimed 本季已理赔结案
+-- 年度额度机制：quota 为本季赔付总额度，paid_total 为累计已赔付；额度内可按事故连续
+-- 报案/定损/赔付（不再一案一季），每次赔付 = min(定损额×比例, 单次上限, 剩余额度)。
+-- status=active 保障中（剩余额度>0 即可继续理赔）| expired 赛季结束到期
+-- | claimed 历史保单（旧「一案一季」机制结案，不再赔付，仅供查询归档）
 CREATE TABLE IF NOT EXISTS insurance (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   plan_id INTEGER NOT NULL,
@@ -148,8 +151,10 @@ CREATE TABLE IF NOT EXISTS insurance (
   premium INTEGER NOT NULL,       -- 保险费（投保即扣，不退）
   coverage REAL NOT NULL,         -- 赔付比例（定损额 × coverage = 赔付额）
   max_payout INTEGER NOT NULL,    -- 单次赔付上限
+  quota INTEGER,                  -- 年度赔付总额度；NULL = 历史保单（启动迁移按方案回填）
+  paid_total INTEGER NOT NULL DEFAULT 0,  -- 本季累计已赔付（额度消耗；越站冲回时回退）
   status TEXT NOT NULL DEFAULT 'active',
-  claimed_incident_id INTEGER,    -- 已理赔结案的事故 id（一案一季）
+  claimed_incident_id INTEGER,    -- 历史保单结案事故 id（旧机制遗留，新机制不再写入）
   created_at TEXT,
   claimed_at TEXT,
   expired_at TEXT
@@ -208,6 +213,10 @@ try { db.exec('ALTER TABLE races ADD COLUMN created_ts INTEGER') } catch (e) {}
 // 老库兼容：seasons 增加事故/理赔统计列（赛季事故与保险赔付归档用）
 try { db.exec('ALTER TABLE seasons ADD COLUMN incidents INTEGER NOT NULL DEFAULT 0') } catch (e) {}
 try { db.exec('ALTER TABLE seasons ADD COLUMN payouts INTEGER NOT NULL DEFAULT 0') } catch (e) {}
+// 老库兼容：insurance 增加年度额度列（年度额度机制：quota 总额度 / paid_total 累计已赔付；
+// quota 为 NULL 的历史保单由服务启动迁移按方案配置回填，claimed 老保单保持结案不再赔付）
+try { db.exec('ALTER TABLE insurance ADD COLUMN quota INTEGER') } catch (e) {}
+try { db.exec('ALTER TABLE insurance ADD COLUMN paid_total INTEGER NOT NULL DEFAULT 0') } catch (e) {}
 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }

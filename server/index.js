@@ -90,21 +90,23 @@ for (const s of RENTAL_SHIPS) {
 }
 
 /* ================= 赛事保险：方案目录（服务端唯一事实来源） =================
- * 每赛季可投保一份（保险费不退、仅当季有效，衔接新赛季自然到期）；一份保单当季只
- * 理赔一次：报案 → 定损（维修费用口径，全部由服务端核定）→ 赔付（定损额 × 赔付比例，
- * 以单次上限封顶）。与商店/租约同口径，客户端只能按 id 投保，价格与比例均不可改写。
+ * 每赛季可投保一份（保险费不退、仅当季有效，衔接新赛季自然到期）；年度额度机制：
+ * 额度（quota）内可按事故连续报案 → 定损（维修费用口径，全部由服务端核定）→ 赔付，
+ * 每次赔付 = min(定损额 × 赔付比例, 单次上限, 剩余额度)，累计赔付（paid_total）达到
+ * 年度额度后本季不再赔付。与商店/租约同口径，客户端只能按 id 投保，价格与比例均不可改写。
  */
 const INSURANCE_PLANS = [
-  { id: 1, name: '云安·基础赛险', premium: 1200, coverage: 0.5, maxPayout: 3000, note: '基础保障，按定损额 50% 赔付，单季一次' },
-  { id: 2, name: '云安·全程护艇险', premium: 2600, coverage: 0.75, maxPayout: 7000, note: '高额护艇，按定损额 75% 赔付，单季一次' },
-  { id: 3, name: '苍穹·旗舰全险', premium: 4800, coverage: 1.0, maxPayout: 15000, note: '全损全赔，按定损额 100% 赔付，单季一次' }
+  { id: 1, name: '云安·基础赛险', premium: 1200, coverage: 0.5, maxPayout: 3000, quota: 6000, note: '基础保障，按定损额 50% 赔付，年度额度内连续理赔' },
+  { id: 2, name: '云安·全程护艇险', premium: 2600, coverage: 0.75, maxPayout: 7000, quota: 15000, note: '高额护艇，按定损额 75% 赔付，年度额度内连续理赔' },
+  { id: 3, name: '苍穹·旗舰全险', premium: 4800, coverage: 1.0, maxPayout: 15000, quota: 32000, note: '全损全赔，按定损额 100% 赔付，年度额度内连续理赔' }
 ]
 const INSURANCE_MAP = new Map(INSURANCE_PLANS.map(p => [p.id, p]))
 for (const p of INSURANCE_PLANS) {
   const ok = typeof p.name === 'string' && p.name.trim() &&
     Number.isInteger(p.premium) && p.premium > 0 &&
     typeof p.coverage === 'number' && p.coverage > 0 && p.coverage <= 1 &&
-    Number.isInteger(p.maxPayout) && p.maxPayout > 0
+    Number.isInteger(p.maxPayout) && p.maxPayout > 0 &&
+    Number.isInteger(p.quota) && p.quota >= p.maxPayout  // 年度额度至少覆盖一次单次上限
   if (!ok) throw new Error('[SKY] 保险方案配置非法：' + JSON.stringify(p))
 }
 // 事故等级与情形文案（事故在开赛瞬间按比赛因素确定性生成，文案随记录走）
@@ -491,14 +493,23 @@ function reverseSettledRace(row, c) {
     run('UPDATE pilots SET exp=MAX(0,exp-?), mood=MIN(100,MAX(0,mood+?)) WHERE id=?',
       expGain, moodLoss, pilotId)
   }
-  // 事故理赔单回滚：已赔付的冲回赔款、恢复保单（claimed→active）；未赔付的报案/定损单只作废；
-  // 坠毁/严重事故的声望扣减同步恢复。资金冲回交由调用方在单一边界统一入账
+  // 事故理赔单回滚：已赔付的冲回赔款、保单额度恢复（paid_total 回退；历史 claimed 保单
+  // 恢复为 active）；未赔付的报案/定损单只作废；坠毁/严重事故的声望扣减同步恢复。
+  // 资金冲回交由调用方在单一边界统一入账
   let repIncidentBack = 0
   if (inc && incRow) {
     if (incRow.status === 'paid') {
       payoutBack = incRow.payout || 0
       if (incRow.claim_id) {
-        run("UPDATE insurance SET status='active', claimed_incident_id=NULL, claimed_at=NULL WHERE id=?", incRow.claim_id)
+        const pol = get('SELECT * FROM insurance WHERE id=?', incRow.claim_id)
+        if (pol && pol.status === 'claimed') {
+          // 历史保单（旧「一案一季」结案）：恢复有效并清结案标记，累计赔付同步回退
+          run("UPDATE insurance SET status='active', claimed_incident_id=NULL, claimed_at=NULL, paid_total=MAX(0,paid_total-?) WHERE id=?",
+            payoutBack, pol.id)
+        } else if (pol) {
+          // 年度额度保单：回退累计赔付即恢复可用额度（状态保持 active）
+          run('UPDATE insurance SET paid_total=MAX(0,paid_total-?) WHERE id=?', payoutBack, pol.id)
+        }
       }
     }
     repIncidentBack = INCIDENT_LEVELS[inc.level]?.repLoss || 0
@@ -842,14 +853,19 @@ function advanceSeason() {
  * 事故在开赛瞬间随比赛记录确定性生成（record.incident），结算时事故损伤施加给出赛艇
  * （自有艇 → parts_dur/hp，租约艇 → wear_total，与正常磨损同口径），并生成物理理赔单
  * （reported）。车队随后可：定损（服务端按出赛艇归属核定维修费用）→ 赔付（当季有效保单、
- * 且保单先于开赛存在，按 coverage 与上限赔付，一案一季，付款幂等）。
+ * 且保单先于开赛存在，按 coverage、单次上限与保单剩余年度额度核定，付款幂等）。
+ * 年度额度机制：一份保单一季内可按事故连续理赔，累计赔付达年度额度（quota）后本季不再赔；
  * 保单按赛季分层：衔接新赛季时有效保单到期、未决理赔单拒付；越站作废按结算口径对称冲回
- * （已赔付的赔款冲回、保单恢复有效）。所有资金/声望改动都在调用方事务边界一次完成。
+ * （已赔付的赔款冲回、保单 paid_total 回退恢复额度；历史 claimed 保单恢复有效）。
+ * 所有资金/声望改动都在调用方事务边界一次完成。
  */
 const OWN_REPAIR_RATE = 25  // 自有艇事故损伤的单位维修费用（与 /api/maintain 的 25/点同价）
 function currentPolicy(season = teamCore().season) {
   return get('SELECT * FROM insurance WHERE season=? ORDER BY id DESC LIMIT 1', season) || null
 }
+// 保单年度额度口径：quota 为 NULL 的历史保单（迁移漏网）按单次上限兜底，等价旧「一案一季」
+const policyQuota = p => (p && Number.isInteger(p.quota) && p.quota > 0) ? p.quota : (p?.max_payout || 0)
+const policyQuotaLeft = p => Math.max(0, policyQuota(p) - (p?.paid_total || 0))
 // 行时间 → epoch ms：新表 created_at 为数字串；老库/中文时间串兜底回退 0（按「不早于」失败处理）
 function tsMs(v) { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : (Date.parse(v) || 0) }
 // 理赔单对外视图：附带比赛/赛道信息、出赛艇归属与当前可执行动作（服务端判定，前端只渲染）
@@ -889,10 +905,11 @@ function claimEligibility(inc, season = teamCore().season, filed = true) {
   if (filed && inc.status === 'void') { res.reason = '该事故记录已随比赛作废'; return res }
   const policy = currentPolicy(season)
   if (!policy || policy.status !== 'active') { res.reason = '当前赛季没有有效保单，请先投保'; return res }
-  if (policy.claimed_incident_id) { res.reason = '本季保单的一次理赔机会已使用'; return res }
+  // 年度额度机制：额度内可连续理赔，累计赔付达年度额度后本季不再赔付
+  if (policyQuotaLeft(policy) <= 0) { res.reason = '本季保单的年度赔付额度已用完'; return res }
   // 事后投保不予理赔：保单必须在该场开赛之前生效（1s 时钟余量：开赛仅早于保单 1s 内仍视为在先）；
   // created_ts 为 epoch 列，老库缺失时回退 created_at 字符串解析（0 = 无法证明在先）
-  if ((Number(race.created_ts) || tsMs(race.created_at)) - 1000 > tsMs(policy.created_at)) {
+  if (tsMs(policy.created_at) - 1000 > (Number(race.created_ts) || tsMs(race.created_at))) {
     res.reason = '保单生效于该场比赛之后，事故不在保障范围'
     return res
   }
@@ -964,6 +981,7 @@ function insurancePayload(season = teamCore().season) {
     policy: policy ? {
       id: policy.id, planId: policy.plan_id, name: policy.name, season: policy.season,
       premium: policy.premium, coverage: policy.coverage, maxPayout: policy.max_payout,
+      quota: policyQuota(policy), paidTotal: policy.paid_total || 0, quotaLeft: policyQuotaLeft(policy),
       status: policy.status, claimedIncidentId: policy.claimed_incident_id,
       createdAt: policy.created_at, claimedAt: policy.claimed_at, expiredAt: policy.expired_at
     } : null,
@@ -993,10 +1011,10 @@ function buyInsurance(planId) {
       result = { status: 400, body: { ok: false, msg: '资金不足，无法支付保险费', price: cfg.premium } }
     } else {
       run('UPDATE team SET money=money-? WHERE id=1', cfg.premium)
-      const r = run(`INSERT INTO insurance (plan_id,name,season,premium,coverage,max_payout,status,created_at)
-        VALUES (?,?,?,?,?,?,'active',?)`,
-        cfg.id, cfg.name, season, cfg.premium, cfg.coverage, cfg.maxPayout, String(Date.now()))
-      result = { status: 200, body: { ok: true, msg: `已投保「${cfg.name}」，保险费 ¥${cfg.premium}（当季有效，理赔一次）`, id: Number(r.lastInsertRowid) } }
+      const r = run(`INSERT INTO insurance (plan_id,name,season,premium,coverage,max_payout,quota,paid_total,status,created_at)
+        VALUES (?,?,?,?,?,?,?,0,'active',?)`,
+        cfg.id, cfg.name, season, cfg.premium, cfg.coverage, cfg.maxPayout, cfg.quota, String(Date.now()))
+      result = { status: 200, body: { ok: true, msg: `已投保「${cfg.name}」，保险费 ¥${cfg.premium}（当季有效，年度额度 ¥${cfg.quota} 内连续理赔）`, id: Number(r.lastInsertRowid) } }
     }
     db.exec('COMMIT')
   } catch (e) {
@@ -1074,8 +1092,10 @@ function assessIncidentById(incidentId) {
   }
   return result
 }
-// 赔付：当季有效保单（且先于开赛）→ 按 coverage 与单次上限核定赔款 → 资金到账、保单结案。
-// 以 incidents.status='assessed' 为唯一闸门（事务内二次校验），重复/并发只赔一次。
+// 赔付：当季有效保单（且先于开赛）→ 按 coverage、单次上限与保单剩余年度额度核定赔款 →
+// 资金到账、累计赔付计入保单（额度内可继续理赔下一事故，不再一案结案）。
+// 以 incidents.status='assessed' 为唯一闸门（事务内二次校验），重复/并发只赔一次；
+// 保单额度扣减（paid_total）与理赔单状态在同一事务原子完成，并发下不会超额赔付。
 function payoutIncident(incidentId) {
   const inc = get('SELECT * FROM incidents WHERE id=?', incidentId)
   if (!inc) return { status: 404, body: { ok: false, msg: '理赔单不存在' } }
@@ -1099,17 +1119,19 @@ function payoutIncident(incidentId) {
       result = { status: 200, body: { ok: true, already: true, incident: incidentBrief(cur.season, cur.race_id) } }
     } else if (cur.status !== 'assessed') {
       result = { status: 409, body: { ok: false, msg: '请先完成定损再申请赔付' } }
-    } else if (!pol || pol.status !== 'active' || pol.claimed_incident_id) {
-      result = { status: 409, body: { ok: false, msg: '保单已失效或本季理赔机会已使用' } }
-    } else if ((Number(race.created_ts) || tsMs(race.created_at)) - 1000 > tsMs(pol.created_at)) {
+    } else if (!pol || pol.status !== 'active') {
+      result = { status: 409, body: { ok: false, msg: '保单已失效或已结案' } }
+    } else if (policyQuotaLeft(pol) <= 0) {
+      result = { status: 409, body: { ok: false, msg: '本季保单的年度赔付额度已用完' } }
+    } else if (tsMs(pol.created_at) - 1000 > (Number(race.created_ts) || tsMs(race.created_at))) {
       result = { status: 409, body: { ok: false, msg: '保单生效于该场比赛之后，事故不在保障范围' } }
     } else {
-      const payout = Math.min(Math.round(cur.assessed * pol.coverage), pol.max_payout)
+      // 赔款 = min(定损额×赔付比例, 单次上限, 剩余年度额度)；保单保持 active，额度内可连续理赔
+      const payout = Math.min(Math.round(cur.assessed * pol.coverage), pol.max_payout, policyQuotaLeft(pol))
       run('UPDATE team SET money=money+? WHERE id=1', payout)
       run("UPDATE incidents SET status='paid', payout=?, claim_id=?, paid_at=? WHERE id=?",
         payout, pol.id, now(), cur.id)
-      run("UPDATE insurance SET status='claimed', claimed_incident_id=?, claimed_at=? WHERE id=?",
-        cur.id, now(), pol.id)
+      run('UPDATE insurance SET paid_total=paid_total+? WHERE id=?', payout, pol.id)
       result = {
         status: 200,
         body: { ok: true, already: false, payout, assessed: cur.assessed, coverage: pol.coverage, incident: incidentBrief(cur.season, cur.race_id) }
@@ -1122,6 +1144,25 @@ function payoutIncident(incidentId) {
     result = { status: 500, body: { ok: false, msg: '赔付失败，请重试' } }
   }
   return result
+}
+
+// 历史保单兼容迁移（启动幂等）：年度额度机制前的老保单 quota 为 NULL——
+//  - active/expired 老保单：按方案配置回填年度额度（方案已下线则按单次上限兜底），
+//    active 保单自此纳入新机制，可在额度内连续理赔；
+//  - claimed 老保单（旧「一案一季」已结案）：回填累计已赔付（取自关联理赔单），
+//    状态保持 claimed 不再赔付，仅供查询与赛季归档。
+// 重复启动不会二次改写（quota 非 NULL 即跳过）。
+function migrateInsurance() {
+  all('SELECT * FROM insurance WHERE quota IS NULL').forEach(p => {
+    const cfg = INSURANCE_MAP.get(p.plan_id)
+    const quota = cfg ? cfg.quota : p.max_payout
+    const paid = p.status === 'claimed' && p.claimed_incident_id
+      ? (get('SELECT payout FROM incidents WHERE id=?', p.claimed_incident_id)?.payout || 0)
+      : 0
+    run('UPDATE insurance SET quota=?, paid_total=? WHERE id=?', quota, paid, p.id)
+    console.log(`[SKY] 历史保单迁移：#${p.id}《${p.name}》(S${p.season}, ${p.status}) 回填年度额度 ${quota}` +
+      (paid ? `、累计已赔付 ${paid}` : ''))
+  })
 }
 
 // 历史数据兼容（迁移补偿）：修复「跳站参赛」产生的脏数据——首个未完成赛站之后的
@@ -1199,6 +1240,7 @@ function reconcileLegacySkips() {
 seed()
 ensureContracts()
 ensureLineup()
+migrateInsurance()
 reconcileLegacySkips()
 // 启动兜底：无越站可修（或老库/注入数据导致合约状态与战绩不一致）时，上面的修复不会跑对账；
 // 这里再幂等对账一次，使「已兑现」始终与本赛季已结算战绩一致（重复执行不产生二次发奖）

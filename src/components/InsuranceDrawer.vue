@@ -62,7 +62,7 @@ async function payout(it) {
   <div class="drawer-mask" @click.self="$emit('close')">
     <aside class="drawer">
       <header class="d-h">
-        <div><h3>🛡️ 赛事保险</h3><div class="d-sub">投保护艇 · 事故报案定损赔付（一案一季）</div></div>
+        <div><h3>🛡️ 赛事保险</h3><div class="d-sub">投保护艇 · 年度额度内按事故连续报案定损赔付</div></div>
         <button class="d-x" @click="$emit('close')">✕</button>
       </header>
 
@@ -76,12 +76,12 @@ async function payout(it) {
 
         <!-- 当前保单 -->
         <section v-if="policy">
-          <div class="sec-h"><b>📃 当前保单</b><span class="d-sub">仅当季有效 · 理赔一次</span></div>
+          <div class="sec-h"><b>📃 当前保单</b><span class="d-sub">仅当季有效 · 年度额度内连续理赔</span></div>
           <div class="policy-card" :class="policy.status">
             <div class="pol-top">
               <b>{{ policy.name }}</b>
-              <span class="tag" :class="policy.status === 'active' ? 'm' : policy.status === 'claimed' ? 'o' : 'b'">
-                {{ policy.status === 'active' ? '✔ 保障中' : policy.status === 'claimed' ? '已理赔结案' : '已到期' }}
+              <span class="tag" :class="policy.status === 'active' ? (policy.quotaLeft > 0 ? 'm' : 'o') : policy.status === 'claimed' ? 'o' : 'b'">
+                {{ policy.status === 'active' ? (policy.quotaLeft > 0 ? '✔ 保障中' : '额度已用尽') : policy.status === 'claimed' ? '已理赔结案（历史保单）' : '已到期' }}
               </span>
             </div>
             <div class="pol-grid">
@@ -89,12 +89,23 @@ async function payout(it) {
               <span>赔付比例<em class="mono">{{ covPct(policy.coverage) }}%</em></span>
               <span>单次上限<em class="mono">¥{{ policy.maxPayout.toLocaleString() }}</em></span>
             </div>
+            <!-- 年度额度：总额度 / 已赔付 / 剩余额度（连续理赔的可用余额） -->
+            <div class="pol-quota">
+              <div class="pq-head">
+                <span>年度赔付额度</span>
+                <b class="mono">¥{{ (policy.quotaLeft ?? 0).toLocaleString() }}<em class="pq-total"> / ¥{{ (policy.quota ?? 0).toLocaleString() }}</em></b>
+              </div>
+              <div class="pq-bar"><i :style="{ width: (policy.quota ? Math.round((policy.paidTotal || 0) / policy.quota * 100) : 0) + '%' }"></i></div>
+              <div class="pq-sub">本季已赔付 ¥{{ (policy.paidTotal || 0).toLocaleString() }}，剩余额度内可继续按事故理赔</div>
+            </div>
             <div class="pol-hint">
               {{ policy.status === 'claimed'
-                ? '本季保单的一次理赔机会已使用，再发生事故仅可维修，不再赔付'
+                ? '历史保单（旧机制一案一季）已理赔结案，不再赔付'
                 : policy.status === 'expired'
                   ? '保单随赛季结束到期，保险费不退'
-                  : '赛中不可投保；保单须在开赛前生效，事故方在保障范围' }}
+                  : policy.quotaLeft > 0
+                    ? '赛中不可投保；保单须在开赛前生效，事故方在保障范围'
+                    : '年度赔付额度已用完，本季再发生事故仅可维修，不再赔付' }}
             </div>
           </div>
         </section>
@@ -112,6 +123,7 @@ async function payout(it) {
               <div class="plan-rows">
                 <div class="rent-row"><span>保险费（当季）</span><b class="mono">¥{{ p.premium.toLocaleString() }}</b></div>
                 <div class="rent-row"><span>单次赔付上限</span><b class="mono">¥{{ p.maxPayout.toLocaleString() }}</b></div>
+                <div class="rent-row"><span>年度赔付额度</span><b class="mono">¥{{ p.quota.toLocaleString() }}</b></div>
               </div>
               <button class="btn sm primary w-full" :disabled="buying || !ins.canInsure || store.team.money < p.premium" @click="buy(p)">
                 {{ ins.canInsure ? `投保 ¥${p.premium.toLocaleString()}` : '比赛进行中不可投保' }}
@@ -150,8 +162,8 @@ async function payout(it) {
               <div v-if="it.assessed" class="cl-rows">
                 <div class="rent-row"><span>定损维修费用</span><b class="mono">¥{{ it.assessed.toLocaleString() }}</b></div>
                 <div v-if="it.status === 'assessed' && policy?.status === 'active'" class="rent-row">
-                  <span>预计赔付（{{ covPct(policy.coverage) }}% · 上限 ¥{{ policy.maxPayout.toLocaleString() }}）</span>
-                  <b class="mono" style="color:var(--mint)">¥{{ Math.min(Math.round(it.assessed * policy.coverage), policy.maxPayout).toLocaleString() }}</b>
+                  <span>预计赔付（{{ covPct(policy.coverage) }}% · 上限 ¥{{ policy.maxPayout.toLocaleString() }} · 剩余额度 ¥{{ (policy.quotaLeft ?? 0).toLocaleString() }}）</span>
+                  <b class="mono" style="color:var(--mint)">¥{{ Math.min(Math.round(it.assessed * policy.coverage), policy.maxPayout, policy.quotaLeft ?? 0).toLocaleString() }}</b>
                 </div>
                 <div v-if="it.status === 'paid'" class="rent-row">
                   <span>实际赔付（{{ it.policyName || '保险' }}）</span>

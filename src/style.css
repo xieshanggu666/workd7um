@@ -516,6 +516,14 @@ tbody tr:hover { background: rgba(255,255,255,.04); }
   background: rgba(20,22,60,.4); border-radius: 10px; padding: 8px 10px;
 }
 .pol-grid em { font-style: normal; font-size: 14px; font-weight: 800; color: var(--txt); }
+/* 年度额度：剩余额度条（连续理赔可用余额） */
+.pol-quota { margin-bottom: 10px; background: rgba(20,22,60,.4); border-radius: 10px; padding: 9px 10px; }
+.pq-head { display: flex; align-items: baseline; justify-content: space-between; font-size: 11px; color: var(--muted); }
+.pq-head b { font-size: 14px; color: var(--mint); }
+.pq-total { font-style: normal; font-size: 11px; color: var(--muted); font-weight: 400; }
+.pq-bar { height: 6px; border-radius: 4px; background: rgba(255,255,255,.08); margin: 7px 0 6px; overflow: hidden; }
+.pq-bar i { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, var(--gold), #ff9f6e); transition: width .3s; }
+.pq-sub { font-size: 10.5px; color: var(--muted); }
 .pol-hint { font-size: 11.5px; color: var(--muted); line-height: 1.5; }
 
 /* 投保方案 */
